@@ -1,0 +1,7 @@
+{
+  "name": "yellow-ai-assignment-1-lead-sniper",
+  "private": true,
+  "scripts": {
+    "test": "node tests/lead-sniper-core.test.js"
+  }
+}

@@ -1,0 +1,10 @@
+.env
+.env.*
+!.env.example
+n8n/.env
+node_modules/
+output/
+logs/
+*.log
+.vscode/
+.idea/

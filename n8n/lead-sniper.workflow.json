@@ -1,0 +1,405 @@
+{
+  "name": "Yellow.ai — Lead Sniper",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "d3dc62d2-0c3d-4a58-9c00-a8f6a6d10002",
+      "name": "Manual Demo Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -960,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 15
+            }
+          ]
+        }
+      },
+      "id": "d3dc62d2-0c3d-4a58-9c00-a8f6a6d10003",
+      "name": "Schedule Trigger — Every 15 Minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -720,
+        -160
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "mode-poll",
+              "name": "mode",
+              "type": "string",
+              "value": "poll"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "d3dc62d2-0c3d-4a58-9c00-a8f6a6d10004",
+      "name": "Polling Mode",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -480,
+        -160
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "mode-demo",
+              "name": "mode",
+              "type": "string",
+              "value": "demo"
+            },
+            {
+              "id": "demo-user",
+              "name": "demoUsername",
+              "type": "string",
+              "value": "={{ $env.LEAD_SNIPER_DEMO_USERNAME || 'octocat' }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "d3dc62d2-0c3d-4a58-9c00-a8f6a6d10005",
+      "name": "Demo Mode",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -720,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Yellow.ai Assignment 1 — Lead Sniper\n// This node handles GitHub polling/enrichment, deduplication, and the required lead rule.\n// GitHub profile requests are deliberately serial to avoid request bursts.\n\nconst input = $input.first()?.json || {};\nconst mode = input.mode || 'poll';\n\nconst token = $env.GITHUB_TOKEN;\nconst owner = $env.LEAD_SNIPER_REPO_OWNER || 'n8n-io';\nconst repo = $env.LEAD_SNIPER_REPO_NAME || 'n8n';\nconst maxStars = Math.min(100, Math.max(1, Number($env.LEAD_SNIPER_MAX_STARS_PER_POLL || 100)));\nconst maxProfiles = Math.max(1, Number($env.LEAD_SNIPER_MAX_PROFILES_PER_POLL || 20));\nconst maxPrimarySleepMs = Math.max(5000, Number($env.LEAD_SNIPER_PRIMARY_RATE_LIMIT_SLEEP_MAX_MS || 120000));\n\nif (!token) {\n  return [{ json: { status: 'CONFIG_ERROR', message: 'GITHUB_TOKEN is not configured.' } }];\n}\n\nconst state = $getWorkflowStaticData('global');\nstate.seenStars = Array.isArray(state.seenStars) ? state.seenStars : [];\nstate.initializedRepos = state.initializedRepos && typeof state.initializedRepos === 'object' ? state.initializedRepos : {};\n\nconst sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));\n\nfunction normalizeHeaders(headers) {\n  if (!headers) return {};\n  const out = {};\n  for (const [key, value] of Object.entries(headers)) out[String(key).toLowerCase()] = value;\n  return out;\n}\n\nfunction errorStatus(error) {\n  return Number(error?.statusCode || error?.response?.statusCode || error?.response?.status || error?.status || 0);\n}\n\nfunction errorHeaders(error) {\n  return normalizeHeaders(error?.response?.headers || error?.headers || {});\n}\n\nasync function githubRequest(url, attempt = 1) {\n  try {\n    const response = await this.helpers.httpRequest({\n      method: 'GET',\n      url,\n      returnFullResponse: true,\n      encoding: 'json',\n      headers: {\n        Authorization: `Bearer ${token}`,\n        Accept: 'application/vnd.github+json',\n        'X-GitHub-Api-Version': '2026-03-10',\n        'User-Agent': 'yellow-ai-lead-sniper'\n      },\n    });\n    const headers = normalizeHeaders(response.headers);\n    const statusCode = Number(response.statusCode || 200);\n\n    if ((headers['x-ratelimit-remaining'] !== undefined) && Number(headers['x-ratelimit-remaining']) < 5) {\n      const resetAt = Number(headers['x-ratelimit-reset']) * 1000;\n      const waitMs = resetAt > Date.now() ? resetAt - Date.now() + 1000 : 0;\n      if (waitMs > 0 && waitMs <= maxPrimarySleepMs) await sleep(waitMs);\n    }\n\n    return { body: response.body, headers, statusCode };\n  } catch (error) {\n    const statusCode = errorStatus(error);\n    const headers = errorHeaders(error);\n\n    if ((statusCode === 403 || statusCode === 429) && attempt <= 3) {\n      const retryAfterSec = Number(headers['retry-after']);\n      const resetAt = Number(headers['x-ratelimit-reset']) * 1000;\n      let waitMs;\n      if (Number.isFinite(retryAfterSec) && retryAfterSec > 0) {\n        waitMs = retryAfterSec * 1000;\n      } else if (Number(headers['x-ratelimit-remaining']) === 0 && resetAt > Date.now()) {\n        waitMs = resetAt - Date.now() + 1000;\n      } else {\n        waitMs = Math.min(60000, 1000 * 2 ** (attempt - 1));\n      }\n\n      if (waitMs <= maxPrimarySleepMs) {\n        await sleep(waitMs);\n        return githubRequest.call(this, url, attempt + 1);\n      }\n\n      return {\n        rateLimited: true,\n        statusCode,\n        headers,\n        message: 'GitHub rate limit reached; current polling cycle stopped safely.'\n      };\n    }\n\n    if (statusCode >= 500 && statusCode <= 599 && attempt <= 3) {\n      await sleep(Math.min(30000, 1000 * 2 ** (attempt - 1)));\n      return githubRequest.call(this, url, attempt + 1);\n    }\n\n    return { error: true, statusCode, headers, message: error?.message || 'GitHub request failed' };\n  }\n}\n\nfunction starKey(star) {\n  const login = star?.user?.login || star?.login || '';\n  const starredAt = star?.starred_at || '';\n  return `${login}|${starredAt}`;\n}\n\nfunction isHighValue(profile) {\n  return Number(profile.followers) > 100 || Number(profile.public_repos) > 50;\n}\n\nfunction remember(key) {\n  if (!key || state.seenStars.includes(key)) return;\n  state.seenStars.push(key);\n  if (state.seenStars.length > 5000) state.seenStars = state.seenStars.slice(-5000);\n}\n\nif (mode === 'demo') {\n  const username = String(input.demoUsername || $env.LEAD_SNIPER_DEMO_USERNAME || 'octocat').trim();\n  const profileResult = await githubRequest.call(this, `https://api.github.com/users/${encodeURIComponent(username)}`);\n  if (!profileResult.body || profileResult.error || profileResult.rateLimited) {\n    return [{ json: { status: 'GITHUB_ERROR', username, ...profileResult } }];\n  }\n  const profile = profileResult.body;\n  const highValue = isHighValue(profile);\n  return [{ json: {\n    status: 'NEW_STAR_DEMO',\n    demo: true,\n    repo: `${owner}/${repo}`,\n    starred_at: new Date().toISOString(),\n    login: profile.login,\n    profile_url: profile.html_url,\n    name: profile.name || profile.login,\n    company: profile.company || 'Not provided',\n    bio: profile.bio || 'Not provided',\n    followers: Number(profile.followers || 0),\n    public_repos: Number(profile.public_repos || 0),\n    location: profile.location || 'Not provided',\n    blog: profile.blog || 'Not provided',\n    email: profile.email || 'Not publicly available',\n    isHighValue: highValue,\n    thresholdReason: highValue ? 'followers > 100 OR public_repos > 50' : 'below both thresholds'\n  }}];\n}\n\nconst stargazerUrl = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/stargazers?per_page=${maxStars}&page=1`;\nconst starsResult = await githubRequest.call(this, stargazerUrl);\n\nif (starsResult.rateLimited || starsResult.error) {\n  return [{ json: { status: 'POLLING_SKIPPED', repo: `${owner}/${repo}`, ...starsResult } }];\n}\n\nconst stars = Array.isArray(starsResult.body) ? starsResult.body : [];\nconst repoKey = `${owner}/${repo}`;\n\nif (!state.initializedRepos[repoKey]) {\n  for (const star of stars) remember(starKey(star));\n  state.initializedRepos[repoKey] = true;\n  return [{ json: { status: 'BOOTSTRAPPED', repo: repoKey, observedStars: stars.length, message: 'Initial snapshot stored; no historical alerts emitted.' } }];\n}\n\nconst unseen = stars.filter((star) => {\n  const key = starKey(star);\n  return key && !state.seenStars.includes(key);\n}).slice(0, maxProfiles);\n\nif (unseen.length === 0) {\n  return [{ json: { status: 'NO_NEW_STARS', repo: repoKey, observedStars: stars.length } }];\n}\n\nconst output = [];\n\nfor (const star of unseen) {\n  const login = star?.user?.login || star?.login;\n  if (!login) continue;\n\n  const profileResult = await githubRequest.call(this, `https://api.github.com/users/${encodeURIComponent(login)}`);\n  const key = starKey(star);\n  remember(key);\n\n  if (!profileResult.body || profileResult.error || profileResult.rateLimited) {\n    output.push({\n      json: {\n        status: profileResult.rateLimited ? 'RATE_LIMITED' : 'PROFILE_ERROR',\n        repo: repoKey,\n        login,\n        starred_at: star?.starred_at || null,\n        ...profileResult\n      }\n    });\n    if (profileResult.rateLimited) break;\n    continue;\n  }\n\n  const profile = profileResult.body;\n  const highValue = isHighValue(profile);\n\n  output.push({\n    json: {\n      status: 'NEW_STAR',\n      demo: false,\n      repo: repoKey,\n      starred_at: star?.starred_at || null,\n      login: profile.login,\n      profile_url: profile.html_url,\n      name: profile.name || profile.login,\n      company: profile.company || 'Not provided',\n      bio: profile.bio || 'Not provided',\n      followers: Number(profile.followers || 0),\n      public_repos: Number(profile.public_repos || 0),\n      location: profile.location || 'Not provided',\n      blog: profile.blog || 'Not provided',\n      email: profile.email || 'Not publicly available',\n      isHighValue: highValue,\n      thresholdReason: highValue ? 'followers > 100 OR public_repos > 50' : 'below both thresholds'\n    }\n  });\n}\n\nreturn output.length ? output : [{ json: { status: 'NO_PROCESSABLE_STARS', repo: repoKey } }];"
+      },
+      "id": "d3dc62d2-0c3d-4a58-9c00-a8f6a6d10006",
+      "name": "GitHub Monitor + Enrich",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -220,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "high-value-condition",
+              "leftValue": "={{ $json.isHighValue }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "d3dc62d2-0c3d-4a58-9c00-a8f6a6d10007",
+      "name": "High-Value Lead Filter",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        20,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "gpt-5-mini",
+          "mode": "list",
+          "cachedResultName": "GPT-5-MINI"
+        },
+        "responses": {
+          "values": [
+            {
+              "role": "system",
+              "content": "You are a B2B sales research assistant. Generate exactly ONE sentence explaining why a high-value GitHub lead is worth reaching out to, using only the supplied bio and company. Do not invent facts. Do not mention follower counts or repository counts. Keep it concise, specific, and professional."
+            },
+            {
+              "content": "={{ `Bio: ${$json.bio}\nCompany: ${$json.company}\nGitHub: ${$json.profile_url}` }}"
+            }
+          ]
+        },
+        "builtInTools": {},
+        "options": {}
+      },
+      "id": "d3dc62d2-0c3d-4a58-9c00-a8f6a6d10008",
+      "name": "AI — Sales Pitch",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 2.1,
+      "position": [
+        260,
+        0
+      ],
+      "retryOnFail": true,
+      "waitBetweenTries": 3000
+    },
+    {
+      "parameters": {
+        "jsCode": "const input = $input.first()?.json || {};\nconst source = $('High-Value Lead Filter').first()?.json || {};\n\nfunction extractPitch(value) {\n  const candidates = [\n    value?.output_text,\n    value?.text,\n    value?.response,\n    value?.message?.content,\n    value?.content,\n    value?.output?.[0]?.content?.[0]?.text,\n    value?.output?.[0]?.content?.[0]?.text?.value,\n    value?.choices?.[0]?.message?.content\n  ];\n  for (const candidate of candidates) {\n    if (typeof candidate === 'string' && candidate.trim()) return candidate.trim().replace(/\\s+/g, ' ');\n  }\n  return 'AI pitch unavailable.';\n}\n\nlet pitch = extractPitch(input);\npitch = pitch.replace(/^['\"]|['\"]$/g, '').trim();\nif (!/[.!?]$/.test(pitch)) pitch += '.';\n\nreturn [{ json: { ...source, salesPitch: pitch } }];"
+      },
+      "id": "d3dc62d2-0c3d-4a58-9c00-a8f6a6d10009",
+      "name": "Format Notification",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        520,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "discord-provider",
+              "leftValue": "={{ ($env.NOTIFICATION_PROVIDER || 'discord').toLowerCase() }}",
+              "rightValue": "discord",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "d3dc62d2-0c3d-4a58-9c00-a8f6a6d10010",
+      "name": "Discord or Slack?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        760,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.DISCORD_WEBHOOK_URL }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { content: `🚨 **High-Value GitHub Lead**\\n**Name:** ${$json.name}\\n**GitHub:** ${$json.profile_url}\\n**Company:** ${$json.company}\\n**Bio:** ${$json.bio}\\n**Followers:** ${$json.followers}\\n**Public repos:** ${$json.public_repos}\\n**AI Sales Pitch:** ${$json.salesPitch}` } }}",
+        "options": {}
+      },
+      "id": "d3dc62d2-0c3d-4a58-9c00-a8f6a6d10011",
+      "name": "Discord Notification",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1020,
+        -100
+      ],
+      "retryOnFail": true,
+      "waitBetweenTries": 3000
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_WEBHOOK_URL }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { text: `🚨 High-Value GitHub Lead\\nName: ${$json.name}\\nGitHub: ${$json.profile_url}\\nCompany: ${$json.company}\\nBio: ${$json.bio}\\nFollowers: ${$json.followers}\\nPublic repos: ${$json.public_repos}\\nAI Sales Pitch: ${$json.salesPitch}` } }}",
+        "options": {}
+      },
+      "id": "d3dc62d2-0c3d-4a58-9c00-a8f6a6d10012",
+      "name": "Slack Notification",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1020,
+        100
+      ],
+      "retryOnFail": true,
+      "waitBetweenTries": 3000
+    }
+  ],
+  "connections": {
+    "Every 15 Minutes": {
+      "main": [
+        [
+          {
+            "node": "Polling Mode",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manual Demo Trigger": {
+      "main": [
+        [
+          {
+            "node": "Demo Mode",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Polling Mode": {
+      "main": [
+        [
+          {
+            "node": "GitHub Monitor + Enrich",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Demo Mode": {
+      "main": [
+        [
+          {
+            "node": "GitHub Monitor + Enrich",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GitHub Monitor + Enrich": {
+      "main": [
+        [
+          {
+            "node": "High-Value Lead Filter",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "High-Value Lead Filter": {
+      "main": [
+        [
+          {
+            "node": "AI — Sales Pitch",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "AI — Sales Pitch": {
+      "main": [
+        [
+          {
+            "node": "Format Notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Notification": {
+      "main": [
+        [
+          {
+            "node": "Discord or Slack?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Discord or Slack?": {
+      "main": [
+        [
+          {
+            "node": "Discord Notification",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Slack Notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Schedule Trigger — Every 15 Minutes": {
+      "main": [
+        [
+          {
+            "node": "Polling Mode",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "timezone": "Asia/Kolkata"
+  },
+  "staticData": null,
+  "active": false,
+  "versionId": "d3dc62d2-0c3d-4a58-9c00-a8f6a6d10099",
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": []
+}

@@ -1,0 +1,42 @@
+services:
+  n8n:
+    image: docker.n8n.io/n8nio/n8n:latest
+    container_name: n8n
+    restart: unless-stopped
+
+    ports:
+      - "5678:5678"
+
+    environment:
+      N8N_HOST: localhost
+      N8N_PORT: 5678
+      N8N_PROTOCOL: http
+      NODE_ENV: production
+      GENERIC_TIMEZONE: Asia/Kolkata
+      TZ: Asia/Kolkata
+
+      N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
+
+      LEAD_SNIPER_REPO_OWNER: "n8n-io"
+      LEAD_SNIPER_REPO_NAME: "n8n"
+      LEAD_SNIPER_DEMO_USERNAME: "octocat"
+
+      LEAD_SNIPER_MAX_STARS_PER_POLL: "100"
+      LEAD_SNIPER_MAX_PROFILES_PER_POLL: "20"
+      LEAD_SNIPER_PRIMARY_RATE_LIMIT_SLEEP_MAX_MS: "120000"
+
+      NOTIFICATION_PROVIDER: "discord"
+
+      # Leave these empty until we configure the webhook.
+      DISCORD_WEBHOOK_URL: ""
+      SLACK_WEBHOOK_URL: ""
+
+      # Put your NEW GitHub token here temporarily only if you choose to.
+      # Better: keep GITHUB_TOKEN in .env and map it below.
+      GITHUB_TOKEN: ${GITHUB_TOKEN}
+
+    volumes:
+      - n8n_data:/home/node/.n8n
+
+volumes:
+  n8n_data:
